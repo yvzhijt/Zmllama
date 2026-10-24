@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use super::shell::psh_run;
+use super::shell::{psh_run, validate_command};
 use super::state::workspace_path;
 use super::truncate_output;
 
@@ -39,7 +39,7 @@ fn ensure_in_workspace(path: &Path) -> Result<PathBuf, String> {
                 match comp {
                     std::path::Component::ParentDir => {
                         if norm == root {
-                            return Err(format!("路径超出工作区：{}", path.display()));
+                            return Err(format!("路径超出��作区：{}", path.display()));
                         }
                         norm.pop();
                     }
@@ -178,6 +178,8 @@ pub fn execute_tool_blocking(name: &str, args: &Value) -> Result<String, String>
         }
         "run" => {
             let command = arg_str(args, "cmd").ok_or("缺少 CMD")?;
+            validate_command(&command)?;
+
             let cwd = match arg_str(args, "path") {
                 Some(p) => resolve_path(&p),
                 None => workspace_path(),
@@ -229,3 +231,5 @@ fn walk_files(dir: &Path, depth: usize, visitor: &mut dyn FnMut(&Path) -> bool) 
         }
     }
 }
+
+""

@@ -36,6 +36,61 @@ fn push_live(line: &str) {
     }
 }
 
+/// 仅允许执行相对安全的单命令，拒绝高危 PowerShell / shell 语法。
+pub fn validate_command(command: &str) -> Result<(), String> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return Err("命令为空，无法执行。".into());
+    }
+
+    let lower = cmd.to_ascii_lowercase();
+    let deny_tokens = [
+        "invoke-expression",
+        "iex ",
+        "start-process",
+        "new-object",
+        "remove-item",
+        "del ",
+        "rd ",
+        "rmdir ",
+        "format-harddisk",
+        "reg.exe",
+        "reg ",
+        "sc.exe",
+        "net.exe",
+        "net ",
+        "powershell",
+        "cmd.exe",
+        "cmd /c",
+        "wscript",
+        "cscript",
+        "curl ",
+        "wget ",
+        "invoke-webrequest",
+        "invoke-restmethod",
+        "set-executionpolicy",
+        "Import-Module",
+        "Add-Type",
+    ];
+
+    for token in deny_tokens {
+        if lower.contains(token) {
+            return Err(format!(
+                "命令被拒绝：包含高危 PowerShell / shell 语法（{token}）。请使用受限的普通命令。"
+            ));
+        }
+    }
+
+    let blocked_chars = [';', '&', '|', '>', '<', '`'];
+    if cmd.chars().any(|ch| blocked_chars.contains(&ch)) {
+        return Err(
+            "命令被拒绝：不允许使用 shell 元字符、重定向或管道。请改为单一命令。".into(),
+        );
+    }
+
+    Ok(())
+}
+
 /// 非阻塞地等待 shell 的下一行（轮询，支持取消与超时）。
 fn wait_line(
     rx: &mut futures_channel::mpsc::UnboundedReceiver<String>,
@@ -198,7 +253,7 @@ impl PersistShell {
 
         let marker = format!("___PSH_END_{nonce}_{n}___");
         let full = format!(
-            "$global:LASTEXITCODE=$null; $err0=$Error.Count; {}try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString($b)) }} finally {{ $ok=$?; $c=0; if($null -ne $LASTEXITCODE){{$c=[int]$LASTEXITCODE}}elseif(-not $ok -or $Error.Count -gt $err0){{$c=1}}; [Console]::Out.WriteLine('{marker}:' + $c); [Console]::Out.Flush() }}\r\n",
+            "$global:LASTEXITCODE=$null; $err0=$Error.Count; {}try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString($b)) }} finally {{ $ok=$?; $c=0; if($null -ne $LASTEXITCODE){{$c=[int]$LASTEXITCODE}}; [Console]::Out.WriteLine('{marker}:{c}') ; [Console]::Out.Flush() }}",
             ps_utf8_var(command),
         );
         self.write_cmd(&full)?;
@@ -260,6 +315,8 @@ impl PersistShell {
 
 /// 在持久 shell 中执行命令（自动管理生命周期）
 pub fn psh_run(command: &str, cwd: Option<&str>) -> Result<(String, Option<i32>), String> {
+    validate_command(command)?;
+
     let mut guard = PSH.lock().unwrap();
     let mut shell = match guard.take() {
         Some(s) => s,
@@ -277,3 +334,5 @@ pub fn psh_run(command: &str, cwd: Option<&str>) -> Result<(String, Option<i32>)
         }
     }
 }
+
+""
