@@ -1,0 +1,27 @@
+#pragma code_page(65001)
+1 VERSIONINFO
+PRODUCTVERSION 0,1,0,0
+FILESUBTYPE 0x0
+FILETYPE 0x1
+FILEVERSION 0,1,0,0
+FILEOS 0x40004
+FILEFLAGSMASK 0x3f
+FILEFLAGS 0x0
+{
+BLOCK "StringFileInfo"
+{
+BLOCK "000004b0"
+{
+VALUE "FileDescription", "Zmllama"
+VALUE "ProductVersion", "0.1.0"
+VALUE "ProductName", "Zmllama"
+VALUE "FileVersion", "0.1.0"
+}
+}
+BLOCK "VarFileInfo"
+{
+VALUE "Translation", 0x0000, 0x04b0
+}
+}
+
+IDI_ICON1 ICON "1.ico"

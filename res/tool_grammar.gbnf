@@ -1,0 +1,14 @@
+# GBNF 语法约束：强制模型只能输出纯文本或合法的 TOOL: 工具调用
+# 适用于不支持原生 function calling 的 2-4B 小模型
+# llama.cpp server 启动参数：--grammar-file tool_grammar.gbnf
+
+root ::= (text-line | tool-block)*
+
+text-line ::= [^\n]+ "\n"
+
+tool-block ::= "TOOL: " tool-name "\n" tool-args "\n"
+tool-name ::= "read" | "search" | "run"
+tool-args ::= read-args | search-args | run-args
+read-args ::= "PATH: " [^\n]+
+search-args ::= "TEXT: " [^\n]+ ("\n" "PATH: " [^\n]+)?
+run-args ::= "CMD: " [^\n]+ ("\n" "PATH: " [^\n]+)?
