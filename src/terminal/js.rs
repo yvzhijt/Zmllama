@@ -141,7 +141,7 @@ pub(super) const INIT_JS: &str = r#"
                 var term = new Terminal({
                     cursorBlink: true,
                     cursorStyle: 'bar',
-                    fontSize: 14,
+                    fontSize: 20,
                     fontFamily: '"Cascadia Code", "Fira Code", "Consolas", "Microsoft YaHei", monospace',
                     theme: currentTheme(),
                     allowProposedApi: true,
@@ -177,6 +177,8 @@ pub(super) const INIT_JS: &str = r#"
                 });
 
                 term.onData(function(d) {
+                    // DEBUG: 追踪第一个输入字符是否到达
+                    window.__inputBridge({ t: 'dbg', msg: 'onData id=' + id + ' data=' + JSON.stringify(d) + ' len=' + d.length });
                     if (window.__inputBridge) window.__inputBridge({ t: 'in', id: id, data: d });
                 });
                 term.onResize(function(e) {
@@ -257,13 +259,7 @@ pub(super) const INIT_JS: &str = r#"
                 }
             },
 
-            setFontSize: function(size) {
-                var keys = Object.keys(this.terms);
-                for (var i = 0; i < keys.length; i++) {
-                    this.terms[keys[i]].term.options.fontSize = size;
-                }
-            },
-        };
+            };
 
         // 接收 Rust 命令并路由到 TermMgr
         (async function() {
@@ -279,7 +275,7 @@ pub(super) const INIT_JS: &str = r#"
                     case 'dead':     window.TermMgr.dispose(msg.id); break;
                     case 'out':      window.TermMgr.write(msg.id, msg.data); break;
                     case 'theme':    window.TermMgr.setTheme(msg.dark); break;
-                    case 'fontSize': window.TermMgr.setFontSize(msg.size); break;
+                    
                 }
             }
         })();

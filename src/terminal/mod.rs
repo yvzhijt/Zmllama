@@ -4,4 +4,4 @@ mod pty;
 mod component;
 
 pub use component::TerminalPanel;
-pub use state::{inject_shell_command, set_font_size, set_theme};
+pub use state::{inject_shell_command, set_theme};

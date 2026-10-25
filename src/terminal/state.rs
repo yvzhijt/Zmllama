@@ -14,13 +14,16 @@ pub(super) static ACTIVE_ID: AtomicU32 = AtomicU32::new(0);
 pub(super) static JS_CMD_TX: LazyLock<Mutex<Option<UnboundedSender<serde_json::Value>>>> =
     LazyLock::new(|| Mutex::new(None));
 
+pub(super) fn dbg(_msg: &str) {}
+
 pub(super) struct SessionHandle {
     #[allow(dead_code)]
     pub name: String,
     pub cmd_tx: UnboundedSender<SessionCmd>,
-    /// PSReadLine 初始化完成后置 true，在此之前 handle_js_message 丢弃所有输入
+    /// PSReadLine 初始化完成后�?true
     pub ready: Arc<AtomicBool>,
     pub child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
+    pub pending_in: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 pub(super) enum SessionCmd {
@@ -62,11 +65,6 @@ pub fn set_theme(dark: bool) {
     send_to_js(serde_json::json!({ "t": "theme", "dark": dark }));
 }
 
-/// 设置终端字体大小
-pub fn set_font_size(size: u32) {
-    send_to_js(serde_json::json!({ "t": "fontSize", "size": size }));
-}
-
 pub(super) fn create_session() -> (u32, String) {
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let name = format!(">_ {id}");
@@ -93,20 +91,50 @@ pub(super) fn close_session(id: u32) {
     }
 }
 
+/// 过滤 xterm.js 内部 CSI 响应，避免回灌 PTY 干扰 PSReadLine
+fn is_csi_response(data: &str) -> bool {
+    let b = data.as_bytes();
+    if b.is_empty() || b[0] != 0x1b {
+        return false;
+    }
+    // FocusIn / FocusOut
+    if data == "\x1b[I" || data == "\x1b[O" {
+        return true;
+    }
+    // Cursor Position Report（CSI ... R），如 \x1b[1;1R
+    if b.len() >= 3 && b[1] == b'[' && b.last() == Some(&b'R') {
+        return true;
+    }
+    false
+}
+
 /// 处理 JS 发来的消息（输入/resize）
 pub(super) fn handle_js_message(msg: serde_json::Value) {
     let id = msg.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     match msg.get("t").and_then(|v| v.as_str()) {
         Some("in") => {
             if let Some(data) = msg.get("data").and_then(|v| v.as_str()) {
+                // 过滤 xterm.js 内部 CSI 响应（CPR、FocusIn/Out），
+                // 避免回灌 PTY 导致 PSReadLine 吞掉第一个输入字符
+                if is_csi_response(data) {
+                    dbg(&format!("in id={id} data={data:?} FILTERED_CSI"));
+                    return;
+                }
                 let sessions = SESSIONS.lock().unwrap();
                 if let Some(s) = sessions.get(&id) {
-                    // PSReadLine 初始化完成前丢弃所有输入，避免 SetConsoleMode 刷缓冲区
-                    if s.ready.load(Ordering::SeqCst) {
-                        let _ = s
-                            .cmd_tx
-                            .unbounded_send(SessionCmd::Write(data.as_bytes().to_vec()));
+                    let bytes = data.as_bytes().to_vec();
+                    let ready = s.ready.load(Ordering::SeqCst);
+                    dbg(&format!("in id={id} data={data:?} ready={ready} pending_count={}", 
+                        s.pending_in.lock().map(|g| g.len()).unwrap_or(0)));
+                    if ready {
+                        let _ = s.cmd_tx.unbounded_send(SessionCmd::Write(bytes));
+                    } else {
+                        if let Ok(mut guard) = s.pending_in.lock() {
+                            guard.push(bytes);
+                        }
                     }
+                } else {
+                    dbg(&format!("in id={id} data={data:?} SESSION_NOT_FOUND"));
                 }
             }
         }
@@ -121,6 +149,11 @@ pub(super) fn handle_js_message(msg: serde_json::Value) {
                     pixel_width: 0,
                     pixel_height: 0,
                 }));
+            }
+        }
+        Some("dbg") => {
+            if let Some(m) = msg.get("msg").and_then(|v| v.as_str()) {
+                dbg(m);
             }
         }
         _ => {}

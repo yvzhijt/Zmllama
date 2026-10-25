@@ -134,6 +134,7 @@ fn spawn_persist_shell() -> Result<PersistShell, String> {
 
     let init = concat!(
         "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
+        "$PSDefaultParameterValues['Out-File:Encoding']='utf8'; ",
         "chcp 65001 > $null; $ProgressPreference='SilentlyContinue'\r\n",
         "[Console]::Out.WriteLine('___PSH_READY___')\r\n",
         "[Console]::Out.Flush()\r\n"
@@ -258,14 +259,110 @@ impl PersistShell {
     }
 }
 
+/// 把 echo "..." > file 转成 Set-Content（修复 \n 转义和 UTF-16 BOM）
+fn convert_echo_write(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if !trimmed.to_lowercase().starts_with("echo ") {
+        return cmd.to_string();
+    }
+    // 找最后一个 > 后面不是 $null / /dev/null / nul 的
+    let gt_pos = match trimmed.rfind(" > ") {
+        Some(p) => p,
+        None => return cmd.to_string(),
+    };
+    let file_part = trimmed[gt_pos + 3..].trim();
+    if file_part.starts_with('$')
+        || file_part.starts_with("/dev/")
+        || file_part.to_lowercase().starts_with("nul")
+    {
+        return cmd.to_string();
+    }
+    let file_path = file_part.trim_end_matches(|c: char| c == ' ' || c == ';');
+
+    // 提取 echo 参数（去掉 echo 前缀和 >file 后缀）
+    let content_part = trimmed[5..gt_pos].trim();
+    // 去掉外层引号
+    let inner = if (content_part.starts_with('"') && content_part.ends_with('"'))
+        || (content_part.starts_with('\'') && content_part.ends_with('\''))
+    {
+        &content_part[1..content_part.len() - 1]
+    } else {
+        content_part
+    };
+    // 反转义：\"→" , \n→换行 , \\→\
+    let unescaped = inner
+        .replace("\\\"", "\"")
+        .replace("\\n", "\n")
+        .replace("\\\\", "\\");
+
+    format!(
+        "Set-Content -Path {file} -Value @\"\n{content}\n\"@ -Encoding UTF8",
+        file = file_path,
+        content = unescaped,
+    )
+}
+
+/// 自动补脚本解释器：s.py → python s.py
+fn prepend_interpreter(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    let lower = trimmed.to_lowercase();
+    // 已经带了解释器就不补
+    if lower.starts_with("python ")
+        || lower.starts_with("python3 ")
+        || lower.starts_with("node ")
+        || lower.starts_with("ruby ")
+        || lower.starts_with("perl ")
+        || trimmed.contains(' ')
+        || trimmed.contains('>')
+        || trimmed.contains('|')
+    {
+        return cmd.to_string();
+    }
+    if lower.ends_with(".py") {
+        return format!("python {trimmed}");
+    }
+    if lower.ends_with(".js") {
+        return format!("node {trimmed}");
+    }
+    if lower.ends_with(".rb") {
+        return format!("ruby {trimmed}");
+    }
+    cmd.to_string()
+}
+
 /// 在持久 shell 中执行命令（自动管理生命周期）
 pub fn psh_run(command: &str, cwd: Option<&str>) -> Result<(String, Option<i32>), String> {
+    // 预处理：echo "..." > file → Set-Content（修复转义和编码问题）
+    let command = convert_echo_write(&command);
+    // 补脚本解释器：s.py → python s.py
+    let command = prepend_interpreter(&command);
+
+    // 预处理：小模型常输出 bash/Linux 语法，自动替换为 PowerShell 兼容形式
+    let command = command
+        // ls 参数（ls -la / ls -l → dir）
+        .replace("ls -la", "dir")
+        .replace("ls -l ", "dir ")
+        .replace("ls -l;", "dir;")
+        .replace("ls -l", "dir")
+        // bash 逻辑运算符 → 顺序执行
+        .replace(" || ", "; ")
+        .replace("|| ", "; ")
+        .replace(" ||", ";")
+        .replace("||", ";")
+        .replace(" && ", "; ")
+        .replace("&& ", "; ")
+        .replace(" &&", "; ")
+        .replace("&&", ";")
+        // stderr 重定向
+        .replace(" 2>/dev/null", " 2>$null")
+        .replace(" 2>&1", " 2>&1");
+
     let mut guard = PSH.lock().unwrap();
     let mut shell = match guard.take() {
         Some(s) => s,
         None => spawn_persist_shell()?,
     };
-    let result = shell.run(command, cwd);
+    let result = shell.run(&command, cwd);
     match result {
         Ok(output) => {
             *guard = Some(shell);

@@ -1,5 +1,6 @@
 mod agent;
 mod llm;
+mod markdown;
 mod panel;
 mod protocol;
 pub mod shell;

@@ -4,6 +4,7 @@ use std::path::Path;
 
 use super::agent::run_agent;
 use super::llm::reset_tools_supported;
+use super::markdown::Markdown;
 use super::protocol::make_system_message;
 use super::state::{cancel_task, respond_approval, ApprovalInfo, Entry, ToolState};
 
@@ -30,6 +31,20 @@ pub fn TaskContent(workspace: Signal<String>) -> Element {
         }
     });
 
+    // 消息列表变动时自动滚动到底部，避免长输出需要手动拖动
+    use_effect(move || {
+        let _ = entries();
+        let n = entries.read().len();
+        if n > 0 {
+            spawn(async move {
+                let _ = document::eval(
+                    r#"(function(){var el=document.querySelector('.chat-messages');if(el){el.scrollTop=el.scrollHeight;}return true;})()"#,
+                )
+                .await;
+            });
+        }
+    });
+
     let mut do_send = move || -> bool {
         let text = input.read().trim().to_string();
         if text.is_empty() || busy() {
@@ -51,11 +66,11 @@ pub fn TaskContent(workspace: Signal<String>) -> Element {
     };
 
     let on_send_click = move |_| {
-        do_send();
-    };
-
-    let on_stop = move |_| {
-        cancel_task();
+        if busy() {
+            cancel_task();
+        } else {
+            do_send();
+        }
     };
 
     let on_reset = move |_| {
@@ -91,7 +106,7 @@ pub fn TaskContent(workspace: Signal<String>) -> Element {
                 div { class: "chat-empty",
                     div { class: "chat-empty-title", "任务模式" }
                     div { class: "chat-empty-hint",
-                        "描述任务，我会调用文件/终端工具分步完成（写操作需审批）"
+                        "描述任务，我可以访问电脑任意文件，危险操作需你确认"
                     }
                 }
             }
@@ -105,16 +120,18 @@ pub fn TaskContent(workspace: Signal<String>) -> Element {
                     },
                     Entry::Thinking(text) => rsx! {
                         div { key: "{i}", class: "msg thinking",
-                            details { open: true,
+                            details { open: false,
                                 summary { class: "thinking-summary", "🤔 思考过程" }
-                                pre { class: "thinking-content", "{text}" }
+                                div { class: "thinking-content",
+                                    Markdown { text: text.clone() }
+                                }
                             }
                         }
                     },
                     Entry::Assistant(text) => rsx! {
                         div { key: "{i}", class: "msg assistant",
                             span { class: "msg-role", "AI" }
-                            "{text}"
+                            Markdown { text: text.clone() }
                         }
                     },
                     Entry::Tool { name, args, state, output } => rsx! {
@@ -192,18 +209,11 @@ pub fn TaskContent(workspace: Signal<String>) -> Element {
                 },
             }
             button {
-                class: "chat-send",
+                class: if is_busy { "chat-send chat-stop-mode" } else { "chat-send" },
                 onclick: on_send_click,
-                disabled: is_busy,
-                title: "发送 (Enter)",
-                "→"
-            }
-            button {
-                class: "chat-stop",
-                onclick: on_stop,
-                disabled: !is_busy,
-                title: "停止",
-                "■"
+                disabled: false,
+                title: if is_busy { "停止生成" } else { "发送 (Enter)" },
+                if is_busy { "■" } else { "→" }
             }
         }
     }

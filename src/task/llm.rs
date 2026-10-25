@@ -30,12 +30,12 @@ pub struct TurnResult {
     pub reasoning: String,
 }
 
-/// 服务端是否支持 tools 参数；不支持时自动降级为文本协议
-static TOOLS_SUPPORTED: AtomicBool = AtomicBool::new(true);
+/// 服务端是否支持 tools 参数；2-4B 小模型默认关闭走文本协议
+static TOOLS_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
-/// 重置 tools 支持标记（用于“重置”任务时恢复）
+/// 重置 tools 支持标记（用于“重置”任务时恢复为关闭状态）
 pub fn reset_tools_supported() {
-    TOOLS_SUPPORTED.store(true, Ordering::SeqCst);
+    TOOLS_SUPPORTED.store(false, Ordering::SeqCst);
 }
 
 fn tool_rejected(status: reqwest::StatusCode, body: &str) -> bool {
@@ -138,11 +138,14 @@ pub async fn stream_turn(
             "model": &model,
             "messages": messages,
             "stream": true,
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "top_k": 30,
+            // 采样参数针对 llama.cpp 中小量化模型调优：
+            // - temperature 过低 + repeat_penalty 过低会让模型陷入循环/退化
+            // - repeat_penalty 提高到 1.18 以抑制重复，代码生成更顺畅
+            "temperature": 0.4,
+            "top_p": 0.92,
+            "top_k": 40,
             "max_tokens": 2048,
-            "repeat_penalty": 1.05,
+            "repeat_penalty": 1.18,
         });
         if use_tools {
             body["tools"] = tool_definitions();

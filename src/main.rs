@@ -16,6 +16,37 @@ mod terminal;
 use task::TaskContent;
 use terminal::TerminalPanel;
 
+// ── 配置持久化 ─────────────────────────────────────────────────
+
+/// 应用配置（主题、字号、工作区）
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AppConfig {
+    dark: bool,
+    workspace: Option<String>,
+}
+
+fn config_path() -> std::path::PathBuf {
+    let dir = std::env::var("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
+        .join("Zmllama");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("config.json")
+}
+
+fn load_config() -> AppConfig {
+    std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(cfg: &AppConfig) {
+    if let Ok(s) = serde_json::to_string(cfg) {
+        let _ = std::fs::write(config_path(), s);
+    }
+}
+
 // 主题菜单项句柄（CheckMenuItem 是 Rc 类型，仅主线程使用）
 thread_local! {
     static THEME_ITEMS: RefCell<(Option<CheckMenuItem>, Option<CheckMenuItem>)> =
@@ -47,28 +78,6 @@ fn build_menu() -> Menu {
     file.append_items(&[&open, &PredefinedMenuItem::separator(), &quit])
         .unwrap();
 
-    let edit = Submenu::new("编辑", true);
-    let font_inc = MenuItem::with_id(
-        "font-inc",
-        "字号 +",
-        true,
-        Some(Accelerator::new(
-            Some(Modifiers::CONTROL),
-            Code::Equal,
-        )),
-    );
-    let font_dec = MenuItem::with_id(
-        "font-dec",
-        "字号 -",
-        true,
-        Some(Accelerator::new(
-            Some(Modifiers::CONTROL),
-            Code::Minus,
-        )),
-    );
-    edit.append_items(&[&font_inc, &font_dec])
-        .unwrap();
-
     let win = Submenu::new("窗口", true);
     let theme_dark = CheckMenuItem::with_id(
         "theme-dark",
@@ -90,7 +99,7 @@ fn build_menu() -> Menu {
         *c.borrow_mut() = (Some(theme_dark), Some(theme_light));
     });
 
-    menu.append_items(&[&file, &edit, &win]).unwrap();
+    menu.append_items(&[&file, &win]).unwrap();
     menu
 }
 
@@ -129,12 +138,35 @@ fn main() {
 }
 
 fn app() -> Element {
+    let cfg = load_config();
     let mut left_pct = use_signal(|| 50.0_f64);
     let mut dragging = use_signal(|| false);
     let mut view_w = use_signal(|| 1200.0_f64);
-    let mut dark = use_signal(|| true);
-    let mut font_size = use_signal(|| 14u32);
-    let mut workspace = use_signal(|| task::workspace_path().display().to_string());
+    let mut dark = use_signal(|| cfg.dark);
+    let mut workspace = use_signal(|| {
+        let p = cfg
+            .workspace
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(task::workspace_path);
+        let p = if p.exists() { p } else { task::workspace_path() };
+        task::set_workspace(p.clone());
+        p.display().to_string()
+    });
+
+    use_effect(move || {
+        // 启动时把菜单勾选同步到已保存的主题
+        let is_dark = dark();
+        THEME_ITEMS.with(|c| {
+            let (d, l) = &*c.borrow();
+            if let Some(i) = d {
+                i.set_checked(is_dark);
+            }
+            if let Some(i) = l {
+                i.set_checked(!is_dark);
+            }
+        });
+    });
 
     use_muda_event_handler(move |event| {
         if event.id() == "open-folder" {
@@ -153,10 +185,14 @@ fn app() -> Element {
                     // 同时切换任务持久 shell 和终端工作目录
                     let escaped = path.to_string_lossy().replace('\'', "''");
                     let _ = terminal::inject_shell_command(format!(
-                        "\r\nSet-Location -LiteralPath '{}'\r\n",
+                        "Set-Location -LiteralPath '{}'\r",
                         escaped
                     ));
                     let _ = task::shell_sync_cwd(path.display().to_string());
+                    save_config(&AppConfig {
+                        dark: dark(),
+                        workspace: Some(path.display().to_string()),
+                    });
                 }
             });
         } else if event.id() == "quit-app" {
@@ -164,6 +200,10 @@ fn app() -> Element {
         } else if event.id() == "theme-dark" {
             dark.set(true);
             terminal::set_theme(true);
+            save_config(&AppConfig {
+                dark: true,
+                workspace: workspace().into(),
+            });
             THEME_ITEMS.with(|c| {
                 let (d, l) = &*c.borrow();
                 if let Some(i) = d {
@@ -176,6 +216,10 @@ fn app() -> Element {
         } else if event.id() == "theme-light" {
             dark.set(false);
             terminal::set_theme(false);
+            save_config(&AppConfig {
+                dark: false,
+                workspace: workspace().into(),
+            });
             THEME_ITEMS.with(|c| {
                 let (d, l) = &*c.borrow();
                 if let Some(i) = d {
@@ -185,14 +229,6 @@ fn app() -> Element {
                     i.set_checked(true);
                 }
             });
-        } else if event.id() == "font-inc" {
-            let new_size = (font_size() + 1).min(32);
-            font_size.set(new_size);
-            terminal::set_font_size(new_size);
-        } else if event.id() == "font-dec" {
-            let new_size = font_size().saturating_sub(1).max(8);
-            font_size.set(new_size);
-            terminal::set_font_size(new_size);
         }
     });
 
@@ -227,7 +263,7 @@ fn app() -> Element {
                             }
                         });
                     },
-                    div { class: "divider-line" }
+                    div { class: "divider-grip" }
                 }
 
                 RightPanel { workspace }
@@ -344,22 +380,51 @@ html, body {
     cursor: col-resize;
 }
 
-.divider-line {
+.divider-grip {
+    position: relative;
+    width: 14px;
+    height: 40px;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.divider-grip::before,
+.divider-grip::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    translate: -50% 0;
     width: 2px;
-    margin: 14px 0;
     border-radius: 2px;
-    background: var(--border);
-    transition: background 0.15s, width 0.15s;
-}
-
-.divider:hover .divider-line {
-    width: 3px;
     background: var(--border-2);
+    transition: background 0.15s, height 0.15s;
 }
 
-.main-container.dragging .divider-line {
-    width: 3px;
+.divider-grip::before {
+    top: 2px;
+    bottom: 2px;
+}
+
+.divider-grip::after {
+    width: 4px;
+    height: 6px;
+    top: 50%;
+    translate: -50% -50%;
+    border-radius: 4px;
+    background: var(--text-muted);
+}
+
+.divider:hover .divider-grip::after {
     background: var(--accent);
+}
+
+.main-container.dragging .divider-grip::after {
+    background: var(--accent);
+    height: 22px;
+    width: 3px;
+    border-radius: 3px;
 }
 
 /* ── 终端 ───────────────────────────────────────────────── */
@@ -394,7 +459,7 @@ html, body {
     border: 1px solid var(--border);
     border-bottom: none;
     border-radius: 8px 8px 0 0;
-    font-size: 12px;
+    font-size: 14.5px;
     color: var(--text-dim);
     cursor: pointer;
     user-select: none;
@@ -421,7 +486,7 @@ html, body {
     background: none;
     border: none;
     color: var(--text-muted);
-    font-size: 14px;
+    font-size: 17px;
     line-height: 1;
     cursor: pointer;
     padding: 0 2px;
@@ -437,7 +502,7 @@ html, body {
     background: none;
     border: 1px dashed var(--border-2);
     color: var(--text-dim);
-    font-size: 15px;
+    font-size: 18px;
     line-height: 1;
     cursor: pointer;
     padding: 3px 10px;
@@ -527,19 +592,19 @@ html, body {
 }
 
 .chat-empty-title {
-    font-size: 15px;
+    font-size: 18px;
     font-weight: 600;
     color: var(--text-dim);
 }
 
 .chat-empty-hint {
-    font-size: 12.5px;
+    font-size: 15px;
 }
 
 .msg {
     max-width: 82%;
     padding: 9px 13px;
-    font-size: 13.5px;
+    font-size: 16.5px;
     line-height: 1.6;
     white-space: pre-wrap;
     word-break: break-word;
@@ -547,7 +612,7 @@ html, body {
 
 .msg-role {
     display: block;
-    font-size: 11px;
+    font-size: 13.5px;
     font-weight: 600;
     margin-bottom: 3px;
     opacity: 0.7;
@@ -560,6 +625,50 @@ html, body {
     color: #1e1e2e;
     border-radius: 14px 14px 4px 14px;
     box-shadow: 0 2px 8px rgba(137, 180, 250, 0.25);
+    white-space: pre-wrap;
+}
+
+.msg.thinking {
+    align-self: flex-start;
+    max-width: 92%;
+    padding: 0;
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.msg.thinking summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 7px 12px;
+    font-size: 14.5px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: var(--panel-2);
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.msg.thinking summary:hover {
+    color: var(--text-dim);
+}
+
+.msg.thinking summary::-webkit-details-marker {
+    display: none;
+}
+
+.thinking-content {
+    padding: 8px 12px 10px;
+    color: var(--text-dim);
+    font-size: 15px;
+    border-top: 1px dashed var(--border);
+}
+
+.thinking-content .md-body {
+    gap: 6px;
 }
 
 .msg.assistant {
@@ -568,6 +677,130 @@ html, body {
     color: var(--text);
     border-radius: 14px 14px 14px 4px;
     border: 1px solid var(--border-2);
+    white-space: normal;
+    max-width: 92%;
+}
+
+/* ── Markdown 渲染 ──────────────────────────────────────────── */
+.md-body {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.md-body p {
+    margin: 0;
+}
+
+.md-p {
+    white-space: normal;
+}
+
+.md-body .md-h1,
+.md-body .md-h2,
+.md-body .md-h3,
+.md-body .md-h4 {
+    margin: 4px 0 2px;
+    line-height: 1.35;
+    color: var(--text);
+    font-weight: 700;
+}
+
+.md-h1 { font-size: 20.5px; }
+.md-h2 { font-size: 19.5px; }
+.md-h3 { font-size: 18px; }
+.md-h4 { font-size: 17px; }
+
+.md-inline-code {
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 1.1em;
+    background: var(--term-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 4px;
+    margin: 0 1px;
+    color: var(--accent);
+}
+
+.md-link {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px dashed var(--accent);
+}
+
+.md-link:hover {
+    text-decoration: underline;
+}
+
+.md-codeblock {
+    display: flex;
+    flex-direction: column;
+    max-width: 100%;
+}
+
+.md-code-lang {
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 13px;
+    color: var(--text-muted);
+    padding: 2px 10px;
+    background: var(--term-bg);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    letter-spacing: 0.5px;
+    user-select: none;
+}
+
+.md-code {
+    margin: 0;
+    padding: 10px;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 14.5px;
+    line-height: 1.5;
+    color: var(--text-dim);
+    background: var(--term-bg);
+    border: 1px solid var(--border);
+    border-radius: 0 8px 8px 8px;
+    overflow-x: auto;
+    white-space: pre;
+    scrollbar-width: thin;
+    scrollbar-color: var(--thumb) var(--term-bg);
+}
+
+.md-codeblock .md-code:only-child {
+    border-radius: 8px;
+}
+
+.md-list {
+    margin: 2px 0;
+    padding-left: 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.md-list li {
+    line-height: 1.55;
+}
+
+.md-quote {
+    margin: 2px 0;
+    padding: 6px 12px;
+    border-left: 3px solid var(--accent);
+    background: var(--panel-2);
+    border-radius: 0 6px 6px 0;
+    color: var(--text-dim);
+}
+
+.md-quote .md-body {
+    gap: 4px;
+}
+
+.md-hr {
+    height: 1px;
+    margin: 6px 0;
+    background: var(--border);
+    border: none;
 }
 
 .chat-input-area {
@@ -584,7 +817,7 @@ html, body {
     min-height: 64px;
     max-height: 160px;
     padding: 10px 12px;
-    font-size: 13.5px;
+    font-size: 16.5px;
     font-family: inherit;
     line-height: 1.5;
     background: var(--input-bg);
@@ -609,7 +842,7 @@ html, body {
     width: 42px;
     height: 42px;
     padding: 0;
-    font-size: 18px;
+    font-size: 22px;
     font-family: inherit;
     font-weight: bold;
     background: var(--accent);
@@ -637,36 +870,16 @@ html, body {
     cursor: not-allowed;
 }
 
-.chat-stop {
-    width: 42px;
-    height: 42px;
-    padding: 0;
-    font-size: 16px;
-    font-family: inherit;
-    font-weight: bold;
+.chat-send.chat-stop-mode {
     background: #f38ba8;
-    color: #1e1e2e;
-    border: none;
-    border-radius: 10px;
-    cursor: pointer;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: filter 0.15s, transform 0.1s;
 }
 
-.chat-stop:hover:not(:disabled) {
-    filter: brightness(1.15);
+.chat-send.chat-stop-mode:hover:not(:disabled) {
+    filter: brightness(1.1);
 }
 
-.chat-stop:active:not(:disabled) {
+.chat-send.chat-stop-mode:active:not(:disabled) {
     transform: scale(0.93);
-}
-
-.chat-stop:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
 }
 
 /* ── 右侧面板 ───────────────────────────────────────────── */
@@ -675,7 +888,7 @@ html, body {
     align-items: center;
     gap: 10px;
     padding: 6px 14px;
-    font-size: 11.5px;
+    font-size: 14px;
     color: var(--text-muted);
     background: var(--panel-2);
     border-bottom: 1px solid var(--border);
@@ -697,7 +910,7 @@ html, body {
     flex-shrink: 0;
     padding: 2px 9px;
     font: inherit;
-    font-size: 11px;
+    font-size: 13.5px;
     background: transparent;
     border: 1px solid var(--border-2);
     color: var(--text-dim);
@@ -715,7 +928,7 @@ html, body {
     align-self: stretch;
     max-width: 100%;
     padding: 8px 10px;
-    font-size: 12px;
+    font-size: 14.5px;
     background: var(--panel-2);
     border: 1px solid var(--border-2);
     border-radius: 10px;
@@ -734,7 +947,7 @@ html, body {
 }
 
 .tool-state {
-    font-size: 11px;
+    font-size: 13.5px;
     padding: 1px 7px;
     border-radius: 999px;
     border: 1px solid currentColor;
@@ -759,7 +972,7 @@ html, body {
 .tool-args {
     margin-top: 6px;
     font-family: Consolas, "Cascadia Mono", monospace;
-    font-size: 11px;
+    font-size: 13.5px;
     color: var(--text-muted);
     white-space: pre-wrap;
     word-break: break-all;
@@ -771,7 +984,7 @@ html, body {
     overflow: auto;
     padding: 8px;
     font-family: Consolas, "Cascadia Mono", monospace;
-    font-size: 11.5px;
+    font-size: 14px;
     line-height: 1.45;
     color: var(--text-dim);
     background: var(--term-bg);
@@ -793,7 +1006,7 @@ html, body {
 
 .approval-title {
     margin-bottom: 6px;
-    font-size: 12.5px;
+    font-size: 15px;
     font-weight: 600;
     color: #f9e2af;
 }
@@ -803,7 +1016,7 @@ html, body {
     overflow: auto;
     padding: 8px;
     font-family: Consolas, "Cascadia Mono", monospace;
-    font-size: 11.5px;
+    font-size: 14px;
     color: var(--text-dim);
     background: var(--term-bg);
     border: 1px solid var(--border);
@@ -823,7 +1036,7 @@ html, body {
 .btn-deny {
     padding: 5px 16px;
     font: inherit;
-    font-size: 12.5px;
+    font-size: 15px;
     font-weight: 600;
     border-radius: 7px;
     cursor: pointer;
