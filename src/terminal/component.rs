@@ -35,7 +35,7 @@ fn do_close_tab(
 }
 
 #[component]
-pub fn TerminalPanel(width_pct: f64, dark_theme: bool) -> Element {
+pub fn TerminalPanel(dark_theme: bool) -> Element {
     let mut sessions = use_signal(Vec::<(u32, String)>::new);
     let mut active = use_signal(|| 0u32);
 
@@ -105,7 +105,7 @@ pub fn TerminalPanel(width_pct: f64, dark_theme: bool) -> Element {
     rsx! {
         div {
             class: "terminal-panel",
-            style: "flex: 0 0 {width_pct}%;",
+            style: "flex: 1 1 0; min-height: 0;",
             div { class: "tab-bar",
                 for (tid, tname) in tabs.into_iter() {
                     div {

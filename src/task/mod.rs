@@ -67,7 +67,7 @@ where
     }
 }
 
-/// 截断输出适配 2-4B 模型有效上下文
+/// 截断输出：UI 展示用，保留较多内容
 pub(crate) fn truncate_output(s: &str) -> String {
     const MAX: usize = 4000;
     let count = s.chars().count();
@@ -79,5 +79,21 @@ pub(crate) fn truncate_output(s: &str) -> String {
     format!(
         "{head}\n…(省略 {omitted} 字符)…\n{tail}",
         omitted = count - 3500
+    )
+}
+
+/// 截断输出：回灌给模型的上下文用，比 UI 更紧
+/// （1500 字符约等于 4B 模型能稳定读完的量，再长会丢掉开头）
+pub(crate) fn truncate_for_context(s: &str) -> String {
+    const MAX: usize = 1500;
+    let count = s.chars().count();
+    if count <= MAX {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(1000).collect();
+    let tail: String = s.chars().skip(count.saturating_sub(400)).collect();
+    format!(
+        "{head}\n…(省略 {omitted} 字符)…\n{tail}",
+        omitted = count - 1400
     )
 }

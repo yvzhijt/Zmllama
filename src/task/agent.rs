@@ -8,6 +8,7 @@ use super::state::{
     workspace_path, ApprovalInfo, Entry, ToolState, APPROVALS, NEXT_APPROVAL, TASK_CANCEL,
 };
 use super::tools::{arg_str, execute_tool_blocking};
+use super::truncate_for_context;
 use super::truncate_output;
 
 // ── 工具执行编排 ───────────────────────────────────────────────
@@ -17,9 +18,14 @@ async fn execute_tool(name: String, args: Value) -> Result<String, String> {
 }
 
 fn tool_needs_approval(name: &str, args: &Value) -> bool {
-    if name != "run" { return false; }
-    let cmd = arg_str(args, "cmd").unwrap_or_default().to_lowercase();
-    DANGEROUS_PATTERNS.iter().any(|p| cmd.contains(p))
+    match name {
+        "run" => {
+            let cmd = arg_str(args, "cmd").unwrap_or_default().to_lowercase();
+            DANGEROUS_PATTERNS.iter().any(|p| cmd.contains(p))
+        }
+        "write_file" => true,
+        _ => false,
+    }
 }
 
 /// 危险命令关键词（匹配到则需审批）
@@ -28,6 +34,8 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     "remove-item -recurse", "rm -rf", "rm -r",
     ":\\windows", ":\\system32", ":\\program files",
     "cargo clean", "git push --force",
+    // 写文件类：模型通过 run 落盘时会命中，先让用户确认
+    "set-content", "out-file", "new-item",
 ];
 
 fn approval_detail(name: &str, args: &Value) -> String {
@@ -35,7 +43,12 @@ fn approval_detail(name: &str, args: &Value) -> String {
         "run" => format!(
             "命令：{}\n目录：{}",
             arg_str(args, "cmd").unwrap_or_default(),
-            arg_str(args, "path").unwrap_or_else(|| workspace_path().display().to_string())
+            workspace_path().display()
+        ),
+        "write_file" => format!(
+            "写入文件：{}\n内容：{}",
+            arg_str(args, "path").unwrap_or_default(),
+            arg_str(args, "content").unwrap_or_default()
         ),
         _ => args.to_string(),
     }
@@ -59,6 +72,61 @@ async fn request_approval(
     allow
 }
 
+// ── 上下文预算 ────────────────────────────────────────────────
+// 4B 模型 + 4096 上下文下，留给对话的预算压到 2600 token（其余留给
+// 模板、特殊 token 与单步 320 token 生成）。超出就丢最早的整组消息。
+
+const CONTEXT_BUDGET: usize = 2600;
+/// 单步最大生成量：放宽后允许模型输出较长回答或代码片段。
+const MAX_TOKENS_PER_STEP: u32 = 600;
+
+/// 粗略 token 估算：CJK 约 1 token/字，ASCII 约 1 token/4 字符。
+fn estimate_tokens(s: &str) -> usize {
+    let mut cjk = 0usize;
+    let mut ascii = 0usize;
+    for c in s.chars() {
+        if (c as u32) > 0x7f {
+            cjk += 1;
+        } else {
+            ascii += 1;
+        }
+    }
+    cjk + ascii / 4
+}
+
+fn msg_tokens(m: &Value) -> usize {
+    let mut n = 4;
+    if let Some(s) = m.get("content").and_then(|v| v.as_str()) {
+        n += estimate_tokens(s);
+    }
+    if let Some(arr) = m.get("tool_calls").and_then(|v| v.as_array()) {
+        for c in arr {
+            n += estimate_tokens(&c.to_string());
+        }
+    }
+    n
+}
+
+/// 从最旧的对话消息开始裁剪，保留 system 与最近的消息。
+/// 若被删除的 assistant 带 tool_calls，紧随其后的 tool 结果一并删除，
+/// 否则 llama.cpp 会因为孤立的 tool 消息报错。
+fn trim_history(history: &mut Vec<Value>) {
+    let mut total: usize = history.iter().map(msg_tokens).sum();
+    while total > CONTEXT_BUDGET && history.len() > 2 {
+        let removed = history.remove(1);
+        total = total.saturating_sub(msg_tokens(&removed));
+        while history
+            .get(1)
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            == Some("tool")
+        {
+            let orphan = history.remove(1);
+            total = total.saturating_sub(msg_tokens(&orphan));
+        }
+    }
+}
+
 // ── Agent 主循环 ──────────────────────────────────────────────
 
 pub async fn run_agent(
@@ -71,7 +139,8 @@ pub async fn run_agent(
     TASK_CANCEL.store(false, Ordering::SeqCst);
     busy.set(true);
 
-    const MAX_STEPS: usize = 20;
+    // 小模型在 5 步之后基本开始随机游走，超出即中止
+    const MAX_STEPS: usize = 5;
     let mut last_tool_signature = String::new();
     let mut repeat_count = 0usize;
 
@@ -87,7 +156,8 @@ pub async fn run_agent(
         let idx = entries.read().len() - 1;
         status.set(format!("思考中（第 {} 步）", step + 1));
 
-        let msgs = history.read().clone();
+        let mut msgs = history.read().clone();
+        trim_history(&mut msgs);
         let result = {
             let mut on_delta = |d: &str| {
                 entries.with_mut(|e| {
@@ -96,7 +166,7 @@ pub async fn run_agent(
                     }
                 });
             };
-            stream_turn(&msgs, &mut on_delta).await
+            stream_turn(&msgs, MAX_TOKENS_PER_STEP, &mut on_delta).await
         };
 
         let turn = match result {
@@ -160,30 +230,21 @@ pub async fn run_agent(
         if !has_calls {
             let lower = turn.content.to_lowercase();
 
-            // 模型输出纯"run"或"runxxx" → 格式纠正
+            // 模型输出纯 "run" / "runxxx" 无命令体 → 格式纠正
             let missed_tool = lower.contains("run") && super::protocol::parse_tool(&turn.content).is_none()
                 && turn.content.trim().chars().count() < 20;
 
-            // 模型拒绝执行或幻觉出终端提示符 → 自动纠正
-            // 只匹配明确的拒绝语句，避免误杀"我无法访问实时数据"这类描述性文本
+            // 模型明确拒绝执行 —— 只匹配最明确的拒绝句式，避免误杀正常对话
             let refused = lower.contains("i can't execute")
                 || lower.contains("i cannot execute")
                 || lower.contains("i'm sorry")
                 || lower.contains("i am sorry")
-                || lower.contains("i'm not able to execute")
                 || (lower.contains("我无法") && lower.contains("执行"))
                 || (lower.contains("我不能") && lower.contains("执行"))
+                // 幻觉出 PowerShell 提示符（这不是正常对话内容）
                 || (lower.contains(":\\") && (lower.contains(">") || lower.contains("$")));
 
-            // 报错后不重试，转而教用户怎么做 → 也算拒绝
-            let teaching = lower.contains("请检查")
-                || lower.contains("请确认")
-                || lower.contains("建议你")
-                || lower.contains("建议您")
-                || lower.contains("确保")
-                || lower.contains("请打开");
-
-            if refused || teaching {
+            if refused {
                 history.write().push(json!({ "role": "assistant", "content": turn.content }));
                 history.write().push(json!({
                     "role": "user",
@@ -422,6 +483,7 @@ pub async fn run_agent(
                 Ok(o) => (ToolState::Ok, o),
                 Err(e) => (ToolState::Err, format!("错误：{e}")),
             };
+
             let shown = truncate_output(&output);
             entries.with_mut(|es| {
                 if let Some(Entry::Tool { state: s, output: out, .. }) = es.get_mut(tidx) {
@@ -429,7 +491,12 @@ pub async fn run_agent(
                     *out = shown.clone();
                 }
             });
-            push_tool_result(&mut history, &call.id, &call.name, shown);
+            push_tool_result(
+                &mut history,
+                &call.id,
+                &call.name,
+                truncate_for_context(&output),
+            );
         }
 
         if stop {

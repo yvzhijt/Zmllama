@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use regex::Regex;
 use super::state::{workspace_path, TASK_CANCEL};
 use super::truncate_output;
 
@@ -277,7 +278,7 @@ fn convert_echo_write(cmd: &str) -> String {
     {
         return cmd.to_string();
     }
-    let file_path = file_part.trim_end_matches(|c: char| c == ' ' || c == ';');
+    let file_path = file_part.trim_end_matches([' ', ';']);
 
     // 提取 echo 参数（去掉 echo 前缀和 >file 后缀）
     let content_part = trimmed[5..gt_pos].trim();
@@ -330,12 +331,139 @@ fn prepend_interpreter(cmd: &str) -> String {
     cmd.to_string()
 }
 
+/// 提取 PowerShell 参数值：支持 `-LiteralPath <bare>`、`-Path '<q>'`、`-Path "<dq>"`。
+fn extract_arg<'a>(cmd: &'a str, param: &str) -> Option<&'a str> {
+    let pat = format!(r"(?i)-{param}\s+");
+    let re = Regex::new(&pat).ok()?;
+    let m = re.find(cmd)?;
+    let after = &cmd[m.end()..];
+    let mut chars = after.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '\'' {
+        let mut end_idx = None;
+        for (i, c) in chars {
+            if c == '\'' { end_idx = Some(i); break; }
+        }
+        let end = end_idx?;
+        Some(&after[1..end])
+    } else if first == '"' {
+        let mut end_idx = None;
+        for (i, c) in chars {
+            if c == '"' { end_idx = Some(i); break; }
+        }
+        let end = end_idx?;
+        Some(&after[1..end])
+    } else {
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == ';' || c == '|')
+            .unwrap_or(after.len());
+        Some(&after[..end])
+    }
+}
+
+/// 针对 Set-Content / Out-File / New-Item -ItemType File：
+/// 自动创建父目录；并把 Set-Content 改写成 .NET WriteAllText 调用，
+/// 以规避 Set-Content 在受保护目录下的 "Access denied"。
+/// 路径和内容统一经 hex 编码注入，避开所有引号/转义/编码坑。
+fn fix_write_commands(cmd: &str) -> String {
+    let lower = cmd.to_lowercase();
+
+    if lower.contains("set-content") {
+        let path = extract_arg(cmd, "LiteralPath")
+            .or_else(|| extract_arg(cmd, "Path"))
+            .map(|p| p.to_string());
+        let value = extract_arg(cmd, "Value")
+            .map(|v| v.to_string());
+
+        if let (Some(p), Some(v)) = (path.as_deref(), value.as_deref()) {
+            let dir_re = Regex::new(r"^(.*?)[\\/][^\\/]*$").ok();
+            let dir = dir_re.and_then(|r| r.captures(p))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_string());
+
+            // 两次 hex 编码：路径和值
+            let dir_cmd = if let Some(d) = dir.as_deref() {
+                let d_slash = d.replace('\\', "/");
+                format!(
+                    "{}New-Item -ItemType Directory -Force -Path ([Text.Encoding]::UTF8.GetString($bp)) | Out-Null; ",
+                    ps_utf8_var(&d_slash)
+                )
+            } else {
+                String::new()
+            };
+
+            let path_hex = to_hex(p);
+            let value_hex = to_hex(v);
+            let p_var = format!(
+                "$bp=New-Object byte[] {n}; for($i=0;$i -lt {n};$i++){{$bp[$i]=[Convert]::ToByte('{hex}'.Substring($i*2,2),16)}}; ",
+                n = p.len(), hex = path_hex
+            );
+            let v_var = format!(
+                "$bv=New-Object byte[] {n}; for($i=0;$i -lt {n};$i++){{$bv[$i]=[Convert]::ToByte('{hex}'.Substring($i*2,2),16)}}; ",
+                n = v.len(), hex = value_hex
+            );
+
+            return format!(
+                "{dir_cmd}{p_var}{v_var}[IO.File]::WriteAllText([Text.Encoding]::UTF8.GetString($bp), [Text.Encoding]::UTF8.GetString($bv))",
+            );
+        }
+        // 只提取到路径没提取到值 —— 至少保证父目录存在
+        if let Some(p) = path.as_deref() {
+            let dir_re = Regex::new(r"^(.*?)[\\/][^\\/]*$").ok();
+            if let Some(dir) = dir_re.and_then(|r| r.captures(p)).and_then(|c| c.get(1)) {
+                return format!(
+                    "New-Item -ItemType Directory -Force -Path '{}' | Out-Null; {}",
+                    dir.as_str().replace('\'', "''"),
+                    cmd,
+                );
+            }
+        }
+    }
+
+    if lower.contains("out-file") {
+        let path = extract_arg(cmd, "LiteralPath")
+            .or_else(|| extract_arg(cmd, "FilePath"))
+            .or_else(|| extract_arg(cmd, "Path"))
+            .map(|p| p.to_string());
+        if let Some(p) = path.as_deref() {
+            let dir_re = Regex::new(r"^(.*?)[\\/][^\\/]*$").ok();
+            if let Some(dir) = dir_re.and_then(|r| r.captures(p)).and_then(|c| c.get(1)) {
+                return format!(
+                    "New-Item -ItemType Directory -Force -Path '{}' | Out-Null; {}",
+                    dir.as_str().replace('\'', "''"),
+                    cmd,
+                );
+            }
+        }
+    }
+
+    if lower.contains("new-item") && lower.contains("-itemtype") && lower.contains("file") {
+        let path = extract_arg(cmd, "LiteralPath")
+            .or_else(|| extract_arg(cmd, "Path"))
+            .map(|p| p.to_string());
+        if let Some(p) = path.as_deref() {
+            let dir_re = Regex::new(r"^(.*?)[\\/][^\\/]*$").ok();
+            if let Some(dir) = dir_re.and_then(|r| r.captures(p)).and_then(|c| c.get(1)) {
+                return format!(
+                    "New-Item -ItemType Directory -Force -Path '{}' | Out-Null; {}",
+                    dir.as_str().replace('\'', "''"),
+                    cmd,
+                );
+            }
+        }
+    }
+
+    cmd.to_string()
+}
+
 /// 在持久 shell 中执行命令（自动管理生命周期）
 pub fn psh_run(command: &str, cwd: Option<&str>) -> Result<(String, Option<i32>), String> {
     // 预处理：echo "..." > file → Set-Content（修复转义和编码问题）
-    let command = convert_echo_write(&command);
+    let command = convert_echo_write(command);
     // 补脚本解释器：s.py → python s.py
     let command = prepend_interpreter(&command);
+    // 预处理：Set-Content / Out-File 改写 —— 自动创建父目录 + 改用 .NET WriteAllText
+    let command = fix_write_commands(&command);
 
     // 预处理：小模型常输出 bash/Linux 语法，自动替换为 PowerShell 兼容形式
     let command = command
@@ -354,8 +482,7 @@ pub fn psh_run(command: &str, cwd: Option<&str>) -> Result<(String, Option<i32>)
         .replace(" &&", "; ")
         .replace("&&", ";")
         // stderr 重定向
-        .replace(" 2>/dev/null", " 2>$null")
-        .replace(" 2>&1", " 2>&1");
+        .replace(" 2>/dev/null", " 2>$null");
 
     let mut guard = PSH.lock().unwrap();
     let mut shell = match guard.take() {

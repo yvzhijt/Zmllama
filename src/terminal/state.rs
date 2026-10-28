@@ -60,6 +60,32 @@ pub fn inject_shell_command(cmd: String) -> bool {
     }
 }
 
+/// Agent 输出透明写入终端（灰色 ANSI 前缀 [Agent]）
+#[allow(dead_code)]
+pub fn write_agent_output(line: &str) {
+    let data = format!("\x1b[90m[Agent]\x1b[0m {}\r\n", line);
+    send_to_js(serde_json::json!({ "t": "agent_out", "data": data }));
+}
+
+/// Agent 命令标题（写入终端，灰色分隔线形式）
+#[allow(dead_code)]
+pub fn write_agent_cmd(cmd: &str, args: &str) {
+    let data = format!("\x1b[90m──── ⚡ {} {} ────\x1b[0m\r\n", cmd, args);
+    send_to_js(serde_json::json!({ "t": "agent_out", "data": data }));
+}
+
+/// 发送 Agent 完成状态行到终端
+#[allow(dead_code)]
+pub fn write_agent_done(ok: bool, name: &str) {
+    let (color, mark) = if ok {
+        ("90", "✓")
+    } else {
+        ("91", "✗")
+    };
+    let data = format!("\x1b[{color}m[Agent {mark}] {name}\x1b[0m\r\n", color = color, mark = mark, name = name);
+    send_to_js(serde_json::json!({ "t": "agent_out", "data": data }));
+}
+
 /// 切换终端配色（暗/亮）
 pub fn set_theme(dark: bool) {
     send_to_js(serde_json::json!({ "t": "theme", "dark": dark }));

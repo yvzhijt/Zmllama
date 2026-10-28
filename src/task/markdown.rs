@@ -150,7 +150,7 @@ fn is_ordered(t: &str) -> bool {
 
 fn rest_non_empty(t: &str) -> bool {
     match t.find('.') {
-        Some(p) => t[p + 1..].trim_start().len() > 0,
+        Some(p) => !t[p + 1..].trim_start().is_empty(),
         None => false,
     }
 }

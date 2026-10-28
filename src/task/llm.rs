@@ -1,9 +1,9 @@
 use dioxus::prelude::*;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
-use super::protocol::{parse_tool, tool_definitions, TOOL_GRAMMAR};
+use super::protocol::{parse_tool, TOOL_GRAMMAR};
 use super::state::{HTTP_CLIENT, TASK_CANCEL};
 use super::{detect_model, LLM_BASE};
 
@@ -28,19 +28,6 @@ pub struct TurnResult {
     pub tool_calls: Vec<ToolCall>,
     pub legacy: bool,
     pub reasoning: String,
-}
-
-/// 服务端是否支持 tools 参数；2-4B 小模型默认关闭走文本协议
-static TOOLS_SUPPORTED: AtomicBool = AtomicBool::new(false);
-
-/// 重置 tools 支持标记（用于“重置”任务时恢复为关闭状态）
-pub fn reset_tools_supported() {
-    TOOLS_SUPPORTED.store(false, Ordering::SeqCst);
-}
-
-fn tool_rejected(status: reqwest::StatusCode, body: &str) -> bool {
-    (status.is_client_error() || status.is_server_error())
-        && body.to_lowercase().contains("tool")
 }
 
 #[derive(Default)]
@@ -126,66 +113,63 @@ impl StreamAccumulator {
 
 pub async fn stream_turn(
     messages: &[Value],
+    max_tokens: u32,
     mut on_delta: impl FnMut(&str),
 ) -> Result<TurnResult, String> {
     use tokio::time::{timeout, Duration};
     let model = detect_model().await?;
     let client = &HTTP_CLIENT;
 
-    let mut use_tools = TOOLS_SUPPORTED.load(Ordering::SeqCst);
-    let resp = loop {
-        let mut body = json!({
-            "model": &model,
-            "messages": messages,
-            "stream": true,
-            // 采样参数针对 llama.cpp 中小量化模型调优：
-            // - temperature 过低 + repeat_penalty 过低会让模型陷入循环/退化
-            // - repeat_penalty 提高到 1.18 以抑制重复，代码生成更顺畅
-            "temperature": 0.4,
-            "top_p": 0.92,
-            "top_k": 40,
-            "max_tokens": 2048,
-            "repeat_penalty": 1.18,
-        });
-        if use_tools {
-            body["tools"] = tool_definitions();
-            body["tool_choice"] = json!("auto");
-        } else {
-            body["grammar"] = json!(TOOL_GRAMMAR);
-            body["response_format"] = json!({"type": "text"});
-        }
+    // 采样参数：temperature 0.4 平衡对话自然度与工具选择稳定性；
+    // grammar 保留 run 分支引导，free 分支放开正常回答。
+    // cache_prompt 让固定 system 前缀命中 KV cache，省掉每步的 prefill。
+    let body = json!({
+        "model": &model,
+        "messages": messages,
+        "stream": true,
+        "cache_prompt": true,
+        "temperature": 0.4,
+        "top_p": 0.9,
+        "top_k": 50,
+        "repeat_penalty": 1.12,
+        "max_tokens": max_tokens,
+        "grammar": TOOL_GRAMMAR,
+        // 思维链模型（NeoHorse / Qwen3 等）默认把 token 全花在 reasoning_content
+        // 上。显式关闭思考：实测单步从 ~10s 降到 ~2.5s。
+        "chat_template_kwargs": { "enable_thinking": false },
+    });
 
-        let req = client
-            .post(format!("{}/chat/completions", LLM_BASE))
-            .json(&body)
-            .send();
-        let resp_res = timeout(Duration::from_secs(180), req)
-            .await
-            .map_err(|_| "请求超时（180s）".to_string())?;
-        let resp = resp_res.map_err(|e| format!("连接失败：{e}"))?;
-        let status = resp.status();
-        if status.is_success() {
-            break resp;
-        }
+    let req = client
+        .post(format!("{}/chat/completions", LLM_BASE))
+        .json(&body)
+        .send();
+    let resp = timeout(Duration::from_secs(60), req)
+        .await
+        .map_err(|_| "连接超时（60s）".to_string())?
+        .map_err(|e| format!("连接失败：{e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        if use_tools && tool_rejected(status, &text) {
-            TOOLS_SUPPORTED.store(false, Ordering::SeqCst);
-            use_tools = false;
-            continue;
-        }
         return Err(format!("服务返回 {status}：{text}"));
-    };
+    }
 
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut acc = StreamAccumulator::default();
 
-    'stream: while let Some(chunk) = stream.next().await {
+    'stream: loop {
         if TASK_CANCEL.load(Ordering::SeqCst) {
             break;
         }
-        let bytes = chunk.map_err(|e| format!("流读取错误：{e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        // 生成中断保护：20s 没有任何新数据就判定服务端卡死
+        let next = match timeout(Duration::from_secs(20), stream.next()).await {
+            Err(_) => return Err("生成超时（20s 无输出）".to_string()),
+            Ok(None) => break,
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(e))) => return Err(format!("流读取错误：{e}")),
+        };
+        buf.push_str(&String::from_utf8_lossy(&next));
 
         while let Some(pos) = buf.find('\n') {
             let line = buf[..pos].trim_end_matches('\r').to_string();

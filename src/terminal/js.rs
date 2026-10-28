@@ -35,50 +35,50 @@ pub(super) const INIT_JS: &str = r#"
         injectCode('xterm-fit', {{FIT}});
 
         var THEME_DARK = {
-            background: '#11111b',
-            foreground: '#cdd6f4',
-            cursor: '#f5e0dc',
-            cursorAccent: '#11111b',
-            selectionBackground: '#585b70',
-            black:  '#45475a',
-            red:    '#f38ba8',
-            green:  '#a6e3a1',
-            yellow: '#f9e2af',
-            blue:   '#89b4fa',
-            magenta:'#f5c2e7',
-            cyan:   '#94e2d5',
-            white:  '#bac2de',
-            brightBlack:  '#585b70',
-            brightRed:    '#f38ba8',
-            brightGreen:  '#a6e3a1',
-            brightYellow: '#f9e2af',
-            brightBlue:   '#89b4fa',
-            brightMagenta:'#f5c2e7',
-            brightCyan:   '#94e2d5',
-            brightWhite:  '#a6adc8',
+            background: '#050b1c',
+            foreground: '#dbe3f5',
+            cursor: '#e2cfaa',
+            cursorAccent: '#050b1c',
+            selectionBackground: '#31457c',
+            black:  '#172347',
+            red:    '#ff8e98',
+            green:  '#79cca4',
+            yellow: '#f0cf8c',
+            blue:   '#9bb0e1',
+            magenta:'#c9a6e0',
+            cyan:   '#8ed6e0',
+            white:  '#e7ecf7',
+            brightBlack:  '#526aa8',
+            brightRed:    '#ff8e98',
+            brightGreen:  '#79cca4',
+            brightYellow: '#e2cfaa',
+            brightBlue:   '#b8c8f0',
+            brightMagenta:'#c9a6e0',
+            brightCyan:   '#8ed6e0',
+            brightWhite:  '#f6f9ff',
         };
         var THEME_LIGHT = {
-            background: '#eff1f5',
-            foreground: '#4c4f69',
-            cursor: '#dc8a78',
-            cursorAccent: '#eff1f5',
-            selectionBackground: '#acb0be',
-            black:  '#5c5f77',
-            red:    '#d20f39',
-            green:  '#40a02b',
-            yellow: '#df8e1d',
-            blue:   '#1e66f5',
-            magenta:'#ea76cb',
-            cyan:   '#179299',
-            white:  '#acb0be',
-            brightBlack:  '#6c6f85',
-            brightRed:    '#d20f39',
-            brightGreen:  '#40a02b',
-            brightYellow: '#df8e1d',
-            brightBlue:   '#1e66f5',
-            brightMagenta:'#ea76cb',
-            brightCyan:   '#179299',
-            brightWhite:  '#bcc0cc',
+            background: '#eef2fa',
+            foreground: '#172347',
+            cursor: '#526aa8',
+            cursorAccent: '#eef2fa',
+            selectionBackground: '#b9c8e6',
+            black:  '#172347',
+            red:    '#c52d3b',
+            green:  '#247650',
+            yellow: '#815c18',
+            blue:   '#405a99',
+            magenta:'#7a4f9e',
+            cyan:   '#0f7280',
+            white:  '#63769d',
+            brightBlack:  '#3c4d75',
+            brightRed:    '#c52d3b',
+            brightGreen:  '#247650',
+            brightYellow: '#9a7c42',
+            brightBlue:   '#405a99',
+            brightMagenta:'#7a4f9e',
+            brightCyan:   '#0f7280',
+            brightWhite:  '#172347',
         };
         window.__darkTheme = true;
         function currentTheme() {
@@ -141,7 +141,7 @@ pub(super) const INIT_JS: &str = r#"
                 var term = new Terminal({
                     cursorBlink: true,
                     cursorStyle: 'bar',
-                    fontSize: 20,
+                    fontSize: 16,
                     fontFamily: '"Cascadia Code", "Fira Code", "Consolas", "Microsoft YaHei", monospace',
                     theme: currentTheme(),
                     allowProposedApi: true,
@@ -275,6 +275,10 @@ pub(super) const INIT_JS: &str = r#"
                     case 'dead':     window.TermMgr.dispose(msg.id); break;
                     case 'out':      window.TermMgr.write(msg.id, msg.data); break;
                     case 'theme':    window.TermMgr.setTheme(msg.dark); break;
+                    case 'agent_out':
+                        var aid = window.TermMgr.activeId;
+                        if (aid) window.TermMgr.write(aid, msg.data);
+                        break;
                     
                 }
             }
@@ -288,7 +292,7 @@ pub(super) const INIT_JS: &str = r#"
 
 pub(super) fn build_init_script() -> String {
     INIT_JS
-        .replace("{{CSS}}", &*CSS_JSON)
-        .replace("{{XTERM}}", &*XTERM_JSON)
-        .replace("{{FIT}}", &*FIT_JSON)
+        .replace("{{CSS}}", &CSS_JSON)
+        .replace("{{XTERM}}", &XTERM_JSON)
+        .replace("{{FIT}}", &FIT_JSON)
 }

@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::agent::run_agent;
-use super::llm::reset_tools_supported;
 use super::markdown::Markdown;
 use super::protocol::make_system_message;
 use super::state::{cancel_task, respond_approval, ApprovalInfo, Entry, ToolState};
@@ -75,7 +74,6 @@ pub fn TaskContent(workspace: Signal<String>) -> Element {
 
     let on_reset = move |_| {
         cancel_task();
-        reset_tools_supported();
         entries.set(Vec::new());
         history.set(Vec::new());
         input.set(String::new());
@@ -95,6 +93,13 @@ pub fn TaskContent(workspace: Signal<String>) -> Element {
     let ws_display = workspace();
 
     rsx! {
+        // 宫殿立绘舞台：空状态大幅出场，有对话后缩小淡出到两侧
+        div {
+            class: if list.is_empty() { "chat-stage" } else { "chat-stage has-log" },
+            div { class: "maid maid-left" }
+            div { class: "maid maid-right" }
+        }
+
         div { class: "task-info",
             span { class: "task-workspace", "工作区：{ws_display}" }
             span { class: "task-status", "{cur_status}" }
@@ -104,9 +109,10 @@ pub fn TaskContent(workspace: Signal<String>) -> Element {
         div { class: "chat-messages",
             if list.is_empty() {
                 div { class: "chat-empty",
-                    div { class: "chat-empty-title", "任务模式" }
-                    div { class: "chat-empty-hint",
-                        "描述任务，我可以访问电脑任意文件，危险操作需你确认"
+                    div { class: "chat-empty-inner",
+                        div { class: "chat-empty-crest" }
+                        div { class: "chat-empty-title", "Zmllama" }
+                        div { class: "chat-empty-sub", "LLAMA ATELIER" }
                     }
                 }
             }
