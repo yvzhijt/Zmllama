@@ -1,7 +1,7 @@
 use base64::Engine;
 use serde_json::Value;
 
-use super::shell::psh_run;
+use super::shell::{psh_run, validate_command};
 use super::state::workspace_path;
 
 pub fn arg_str(args: &Value, key: &str) -> Option<String> {
