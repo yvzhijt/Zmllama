@@ -82,11 +82,11 @@ pub fn validate_command(command: &str) -> Result<(), String> {
         }
     }
 
-    let blocked_chars = [';', '&', '|', '>', '<', '`'];
+    // 只拦反引号（命令替换/转义）。分号、管道、重定向是正常 shell 语法，
+    // 且 search / write_file 等内置工具依赖它们，不能一刀切拒绝。
+    let blocked_chars = ['`'];
     if cmd.chars().any(|ch| blocked_chars.contains(&ch)) {
-        return Err(
-            "命令被拒绝：不允许使用 shell 元字符、重定向或管道。请改为单一命令。".into(),
-        );
+        return Err("命令被拒绝：不允许使用反引号命令替换。请改为单一命令。".into());
     }
 
     Ok(())
@@ -255,7 +255,7 @@ impl PersistShell {
 
         let marker = format!("___PSH_END_{nonce}_{n}___");
         let full = format!(
-            "$global:LASTEXITCODE=$null; $err0=$Error.Count; {}try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString($b)) }} finally {{ $ok=$?; $c=0; if($null -ne $LASTEXITCODE){{$c=[int]$LASTEXITCODE}}; [Console]::Out.WriteLine('{marker}:{c}') ; [Console]::Out.Flush() }}",
+            "$global:LASTEXITCODE=$null; $err0=$Error.Count; {}try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString($b)) }} finally {{ $ok=$?; $c=0; if($null -ne $LASTEXITCODE){{$c=[int]$LASTEXITCODE}}elseif(-not $ok -or $Error.Count -gt $err0){{$c=1}}; [Console]::Out.WriteLine('{marker}:' + $c); [Console]::Out.Flush() }}\r\n",
             ps_utf8_var(command),
         );
         self.write_cmd(&full)?;
@@ -513,6 +513,8 @@ fn fix_write_commands(cmd: &str) -> String {
 
 /// 在持久 shell 中执行命令（自动管理生命周期）
 pub fn psh_run(command: &str, cwd: Option<&str>) -> Result<(String, Option<i32>), String> {
+    // 只对模型给出的原始命令做安全校验；后续预处理生成的是我们自己的固定脚本
+    validate_command(command)?;
     // 预处理：echo "..." > file → Set-Content（修复转义和编码问题）
     let command = convert_echo_write(command);
     // 补脚本解释器：s.py → python s.py
@@ -556,5 +558,3 @@ pub fn psh_run(command: &str, cwd: Option<&str>) -> Result<(String, Option<i32>)
         }
     }
 }
-
-""
